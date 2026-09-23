@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.venv/
+venv/
+.DS_Store
+# Source deck kept out of the public repo (14 MB, and the Space rejects files >10 MB without LFS)
+*.pptx
