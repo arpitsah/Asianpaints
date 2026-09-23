@@ -24,7 +24,7 @@ def test_add_product_via_form(at):
     k = f"calc_{new_id}"
     at.radio(key=f"{k}_mode").set_value("manual").run()
     at.text_input(key=f"{k}_name").input("Demo Added SKU")
-    vals = {"age": 30, "current_t3m": 1200, "t3m_y1": 1000, "t3m_y2": 950, "forecast": 1000, "actual": 950,
+    vals = {"age": 30, "current_t3m": 1200, "previous_t3m": 1000, "t3m_y1": 950, "forecast": 1000, "actual": 950,
             "active_points": 400, "total_points": 1000, "current_volume": 1200, "peak_volume": 1300,
             "avg_daily_demand": 13, "std_daily_demand": 4, "lead_time_local_days": 7}
     for f, v in vals.items():
@@ -43,7 +43,7 @@ def test_edit_product_changes_lss(at):
     at.button(key="calc_edit").click().run()
     k = f"calc_{pid}"
     at.radio(key=f"{k}_mode").set_value("manual").run()
-    for f, v in {"current_t3m": 300, "t3m_y1": 1000, "t3m_y2": 1100, "forecast": 1000, "actual": 300,
+    for f, v in {"current_t3m": 300, "previous_t3m": 1000, "t3m_y1": 1100, "forecast": 1000, "actual": 300,
                  "active_points": 50, "total_points": 12000, "current_volume": 300, "peak_volume": 5000}.items():
         at.number_input(key=f"{k}_{f}").set_value(v)
     at.button(key=f"FormSubmitter:{k}_form-Save product").click().run()
@@ -74,7 +74,7 @@ def test_inventory_form_changes_safety_stock(at):
 
 
 def test_momentum_strict_mode(at):
-    at.radio(key="set_mom_fb").set_value("strict").run()
+    at.radio(key="set_mom_fb2").set_value("strict").run()
     assert not at.exception
     res = at.session_state._engine_out["results"]
     royale = next(r for r in res.values() if r["product"]["name"].startswith("Royale"))

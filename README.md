@@ -17,7 +17,7 @@ A Streamlit decision system built on the *Breaker of Chains* deck (IIM Bangalore
 ```bash
 pip install -r requirements-dev.txt
 streamlit run app.py
-python -m pytest -q tests      # 41 engine + UI tests
+python -m pytest -q tests      # 44 engine + UI tests
 ```
 
 ## Deploy
@@ -59,6 +59,7 @@ Edit only the function; everything else (tables, charts, alerts, "View calculati
 | Change | Edit |
 |---|---|
 | Momentum | `calculate_momentum()` |
+| Seasonal indices for deseasonalising | `estimate_seasonal_indices()` |
 | Predictability | `calculate_predictability()` |
 | Reach | `calculate_reach()` |
 | Position | `calculate_position()` |
@@ -74,11 +75,11 @@ Each function returns a `Metric` carrying its own formula text, inputs and worki
 
 ## Formulas and where they come from
 
-**Final formulas (supplied 23 Sep 2026)**
+**Final formulas (supplied 23 Sep 2026; Momentum revised the same day)**
 
 | Item | Formula |
 |---|---|
-| Momentum | [ (S_T3M,y0 ÷ S_T3M,y−1) + (S_T3M,y0 ÷ S_T3M,y−2) ] ÷ 2 − 1 (same three months one and two years back) |
+| Momentum | [ (S′_Qt ÷ S′_Qt−1) + (S′_Qt ÷ S′_Qt−4) ] ÷ 2 − 1 — average of QoQ and YoY growth on deseasonalised sales; S′ = sales ÷ seasonal index; Q_t = latest 3 months, Q_t−1 = the 3 before, Q_t−4 = same quarter last year |
 | Seasonal demand | d̄ = average daily demand × seasonality index |
 | Lead time (mean) | L̄ = p·L_local + (1−p)·L_cross-city, p = share fulfilled from the local depot |
 | Lead time (variance) | σ_L² = p·σ_local² + (1−p)·σ_cross² + p(1−p)·(L_cross − L_local)² |
@@ -105,8 +106,16 @@ Introduction / Growth / Maturity (tested). Decline cycle stock now follows EOQ i
 
 ### Assumptions (labelled "Assumption" in the UI, all configurable)
 
-- **Momentum for young SKUs.** The formula needs 27 months of history. The sidebar picks the fallback:
-  *y−1 only, then sequential T3M growth* (default), *y−1 only*, or *strict* (N/A → SKU unclassified).
+- **Seasonal indices** (the formula doesn't say how to deseasonalise). `estimate_seasonal_indices()` uses
+  classical multiplicative decomposition: each month's sales ÷ its centred 2×12 moving average, averaged per
+  calendar month and normalised to 1.0. Ratios are pooled across SKUs with 24+ months of history, and each
+  SKU uses its **category** indices, else its **channel**'s, else the portfolio's. A quarter's index is
+  Σ sales ÷ Σ(sales ÷ monthly index). Indices are estimated once from full history, so the month-by-month
+  replay uses slightly forward-looking indices. Manual-entry SKUs take seasonal indices typed in (blank = 1.0).
+- **Momentum for SKUs under 15 months** (no same quarter last year). The sidebar picks *QoQ term only*
+  (default) or *strict* (N/A → SKU unclassified).
+- **Position is not deseasonalised** (deck formula unchanged), so a SKU in its seasonal low quarter sits
+  further from its peak.
 - **EOQ annual demand D** uses the unadjusted average daily demand × 365 (a seasonal peak is not annualised).
 - **Decline CS** is taken literally as √(2DS/H); the textbook average cycle stock would be EOQ ÷ 2.
 - Missing seasonality index → 1.0; missing σ_local / σ_cross → 0 (both noted in the working).

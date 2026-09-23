@@ -93,9 +93,29 @@ def _months(n: int) -> list[str]:
     return [str(end - (n - 1 - i)) for i in range(n)]
 
 
+# Illustrative monthly seasonality baked into the demo sales (the engine re-estimates it from the data).
+# B2C décor: festive peak Sep-Nov, monsoon dip Jun-Aug.  B2B projects: pre-monsoon peak Mar-May.
+SEASON_PATTERN = {
+    "B2C": {1: 0.97, 2: 0.98, 3: 1.02, 4: 1.00, 5: 0.98, 6: 0.90, 7: 0.86, 8: 0.90, 9: 1.08, 10: 1.18,
+            11: 1.12, 12: 1.01},
+    "B2B": {1: 1.00, 2: 1.04, 3: 1.12, 4: 1.15, 5: 1.10, 6: 0.92, 7: 0.85, 8: 0.88, 9: 0.96, 10: 1.00,
+            11: 0.99, 12: 0.99},
+}
+
+
+def _solve_ratio(g: float, lag_a: int, lag_b: int | None) -> float:
+    """Monthly compounding rate r so that [(r^lag_a) + (r^lag_b)]/2 − 1 = g (or r^lag_a − 1 = g)."""
+    lo, hi = 0.5, 1.5
+    f = (lambda r: r ** lag_a - 1) if lag_b is None else (lambda r: (r ** lag_a + r ** lag_b) / 2 - 1)
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if f(mid) < g else (lo, mid)
+    return (lo + hi) / 2
+
+
 def _series(age: int, m_pct: float, peak_ratio: float, growth: float | None = None, mode: str = "normal"):
-    """Monthly volume index (last month = 1.0) over up to 36 months, built so the SKU's
-    year-on-year momentum and 24-month peak ratio follow the Annexure A ordering."""
+    """Deseasonalised monthly volume index (last month = 1.0), up to 36 months, built so the
+    SKU's QoQ+YoY momentum and 24-month peak ratio follow the Annexure A ordering."""
     h = min(age, HISTORY_MONTHS)
     if age <= 9:  # launch ramp
         x = np.arange(1, h + 1) / h
@@ -103,22 +123,21 @@ def _series(age: int, m_pct: float, peak_ratio: float, growth: float | None = No
     g = growth if growth is not None else -0.35 + 0.006 * m_pct  # momentum, monotonic in Momentum %ile
     if mode == "late_drop":  # slow erosion, then a sharp one-month fall (shows 2-month validation)
         v = np.linspace(1.12, 1.0, 36)
-        v[35] = 3 * (1 + g) * v[21:24].mean() - v[33:35].sum()
+        prev, yoy = v[30:33].sum(), v[21:24].sum()
+        cur = (1 + g) * 2 / (1 / prev + 1 / yoy)
+        v[35] = cur - v[33:35].sum()
         return list(v[-h:])
-    if age < 27:  # too young for y-2: steady compounding ramp
-        months_back = 3 if age < 15 else 12   # sequential fallback vs y-1 fallback
-        r = (1 + g) ** (1 / months_back)
+    if age < 15:  # no same-quarter-last-year yet: compounding ramp, QoQ = 1 + g
+        r = _solve_ratio(g, 3, None)
         return list(r ** (np.arange(h) - (h - 1)))
-    # 36 months: y-2 window idx 9-11, y-1 window 21-23, current 33-35, peak within the last 24 (12-35)
+    # 36 months: Q_t−4 = idx 21-23, Q_t−1 = 30-32, Q_t = 33-35; peak within the last 24 (12-35)
     c, Y, P = 1.0, 1.0 / (1 + g), 1.0 / peak_ratio
-    kp = 27 if peak_ratio >= 0.93 else (16 if peak_ratio >= 0.8 else 13)
-    anchors = {0: Y, 11: Y, kp - 1: P, kp + 1: P, 21: Y, 23: Y, 33: c, 35: c}
-    if kp < 21:
-        anchors.update({12: min(Y, P)})
+    kp, start = (27, 0.70 * P) if peak_ratio >= 0.93 else ((16, 0.93 * P) if peak_ratio >= 0.8 else (13, 0.90 * P))
+    anchors = {0: min(start, P), kp - 1: P, kp + 1: P, 21: Y, 23: Y, 30: Y, 32: Y, 33: c, 35: c}
     xs = sorted(anchors)
     v = np.interp(np.arange(36), xs, [anchors[x] for x in xs])
     v[kp - 1:kp + 2] = P
-    v[21:24], v[9:12], v[33:36] = Y, Y, c
+    v[21:24], v[30:33], v[33:36] = Y, Y, c
     return list(v[-h:])
 
 
@@ -136,7 +155,7 @@ def _product(row, idx: int) -> dict:
     late = peak < 0.6                                 # Decline / Exit: used to be predictable
     hist = []
     for i, (m, s) in enumerate(zip(months, shape)):
-        actual = round(vol * s)
+        actual = round(vol * s * SEASON_PATTERN["B2B" if b2b else "B2C"][int(m[5:7])])
         e = mape if (not late or i >= len(shape) - 12) else 0.10
         sign = 1 if rng.random() < 0.5 else -1
         forecast = round(actual * (1 + sign * e))
@@ -151,7 +170,7 @@ def _product(row, idx: int) -> dict:
         "age_months": age, "is_demo": True, "input_mode": "history", "history": hist,
         "total_points": total,
         # manual fields (used only if the user switches the SKU to manual entry)
-        "current_t3m": None, "previous_t3m": None, "t3m_y1": None, "t3m_y2": None,
+        "current_t3m": None, "previous_t3m": None, "t3m_y1": None, "si_q_t": None, "si_q_prev": None,
         "current_volume": None, "peak_volume": None, "forecast": None, "actual": None, "active_points": None,
         # inventory - Layer 2
         "avg_daily_demand": d, "std_daily_demand": round(d * cv, 1), "seasonality_index": season,
@@ -178,7 +197,7 @@ def blank_product() -> dict:
     return {
         "id": uuid.uuid4().hex[:8], "name": "", "category": "Decorative Paints", "channel": "B2C",
         "age_months": 12, "is_demo": False, "input_mode": "manual", "history": [],
-        "current_t3m": None, "previous_t3m": None, "t3m_y1": None, "t3m_y2": None,
+        "current_t3m": None, "previous_t3m": None, "t3m_y1": None, "si_q_t": None, "si_q_prev": None,
         "current_volume": None, "peak_volume": None,
         "forecast": None, "actual": None, "active_points": None, "total_points": None,
         "avg_daily_demand": None, "std_daily_demand": None, "seasonality_index": 1.0, "local_share": 1.0,

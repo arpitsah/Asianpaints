@@ -8,6 +8,7 @@ only calls these functions and renders what they return.
 To change a formula, edit ONLY its function:
 
     Momentum ................ calculate_momentum()
+    Seasonal indices ........ estimate_seasonal_indices()
     Predictability .......... calculate_predictability()
     Reach ................... calculate_reach()
     Position ................ calculate_position()
@@ -78,7 +79,8 @@ LIFECYCLE_THRESHOLDS = {
 }
 
 DATA_RULES = {
-    "min_months_momentum": 27,       # current T3M + same T3M 1 and 2 years back
+    "min_months_momentum": 15,       # Q_t, Q_t-1 and Q_t-4 (same quarter last year)
+    "min_months_seasonality": 24,    # a SKU needs 2 years to contribute to seasonal indices
     "min_months_predictability": 3,  # periods with forecast and actual
     "mape_window_months": 12,        # deck: measured over 12 months
     "peak_window_months": 24,        # deck: peak over last 24 months
@@ -201,7 +203,7 @@ class EngineSettings:
     min_peers: int = 5                     # below this, percentile falls back to absolute
     confirm_enabled: bool = True           # two-month validation rule (slide 4)
     confirm_months: int = 2
-    momentum_fallback: str = "chain"       # "strict" | "yoy" | "chain"  (see calculate_momentum)
+    momentum_fallback: str = "qoq"         # "qoq" | "strict"  (see calculate_momentum)
     ordering_cost: float = 1000.0          # Rs/order (slide 7 assumption box)
     holding_rate: float = 0.20             # 20% p.a. (slide 7 assumption box)
     shelf_life_cap: bool = True            # guardrail (assumption)
@@ -271,30 +273,96 @@ def history_frame(history) -> pd.DataFrame:
     return df.sort_values("month").drop_duplicates("month", keep="last").reset_index(drop=True)
 
 
-def derive_inputs_from_history(history, upto: int | None = None) -> dict:
+def estimate_seasonal_indices(products: dict[str, dict]) -> dict:
+    """Monthly seasonal indices for deseasonalising sales (ASSUMPTION - method not specified).
+    Classical multiplicative decomposition: ratio of each month's sales to its centred 2×12
+    moving average, averaged per calendar month and normalised to mean 1.0.
+    Ratios are pooled across SKUs so young SKUs can be deseasonalised too; only SKUs with
+    ≥ 24 months of history contribute. Lookup hierarchy: category → channel → portfolio.
+    Returns {"category": {...}, "channel": {...}, "portfolio": {month: SI}, "counts": {...}}."""
+    pools: dict[tuple, dict[int, list]] = {}
+    counts: dict[tuple, int] = {}
+    for p in products.values():
+        if p.get("input_mode") != "history":
+            continue
+        df = history_frame(p.get("history"))
+        if len(df) < DATA_RULES["min_months_seasonality"] or df["sales_volume"].isna().any():
+            continue
+        sales = df["sales_volume"].astype(float)
+        cma = sales.rolling(12).mean().rolling(2).mean().shift(-6)   # centred 2×12 MA
+        ratio = sales / cma
+        months = df["month"].str.slice(5, 7).astype(int)
+        for key in (("category", p.get("category")), ("channel", p.get("channel")), ("portfolio", "all")):
+            counts[key] = counts.get(key, 0) + 1
+            bucket = pools.setdefault(key, {})
+            for m, r in zip(months, ratio):
+                if pd.notna(r) and r > 0:
+                    bucket.setdefault(int(m), []).append(float(r))
+    out: dict[str, Any] = {"category": {}, "channel": {}, "portfolio": {}, "counts": {}}
+    for (level, name), bucket in pools.items():
+        if len(bucket) < 12:
+            continue
+        raw = {m: float(np.mean(v)) for m, v in bucket.items()}
+        k = float(np.mean(list(raw.values())))
+        idx = {m: raw[m] / k for m in range(1, 13)}
+        if level == "portfolio":
+            out["portfolio"] = idx
+        else:
+            out[level][name] = idx
+        out["counts"][f"{level}:{name}"] = counts[(level, name)]
+    return out
+
+
+def seasonal_indices_for(product: dict, indices: dict | None) -> tuple[dict | None, str]:
+    """Pick the index set for a product: category → channel → portfolio → none."""
+    if not indices:
+        return None, "none (no SKU with 24+ months of history)"
+    if product.get("category") in indices.get("category", {}):
+        return indices["category"][product["category"]], f"category '{product['category']}'"
+    if product.get("channel") in indices.get("channel", {}):
+        return indices["channel"][product["channel"]], f"channel {product['channel']}"
+    if indices.get("portfolio"):
+        return indices["portfolio"], "portfolio"
+    return None, "none (no SKU with 24+ months of history)"
+
+
+def derive_inputs_from_history(history, upto: int | None = None, seasonal: dict | None = None) -> dict:
     """Turn monthly history into the snapshot inputs the signal functions use.
-    `upto` = index of the last month to use (for month-by-month replay)."""
+    `upto` = index of the last month to use (for month-by-month replay).
+    `seasonal` = {calendar month: seasonal index}; each quarter's effective index is
+    raw quarter sales ÷ deseasonalised quarter sales (Σ S_m ÷ Σ S_m/SI_m)."""
     df = history_frame(history)
     if upto is not None:
         df = df.iloc[: upto + 1]
     n = len(df)
     out = {"months_available": n, "as_of": df["month"].iloc[-1] if n else None,
-           "current_t3m": None, "previous_t3m": None, "t3m_y1": None, "t3m_y2": None, "current_volume": None,
+           "current_t3m": None, "previous_t3m": None, "t3m_y1": None,
+           "si_q_t": None, "si_q_prev": None, "si_q_yoy": None, "current_volume": None,
            "peak_volume": None, "actuals": [], "forecasts": [], "active_points": None}
     if n == 0:
         return out
     vol = df["sales_volume"]
-    if n >= 3 and vol.iloc[-3:].notna().all():
-        out["current_t3m"] = float(vol.iloc[-3:].sum())
-        out["current_volume"] = out["current_t3m"]
-        window = vol.iloc[-DATA_RULES["peak_window_months"]:]
-        out["peak_volume"] = float(window.rolling(3).sum().max())
-    if n >= 6 and vol.iloc[-6:-3].notna().all():
-        out["previous_t3m"] = float(vol.iloc[-6:-3].sum())
-    if n >= 15 and vol.iloc[-15:-12].notna().all():
-        out["t3m_y1"] = float(vol.iloc[-15:-12].sum())
-    if n >= 27 and vol.iloc[-27:-24].notna().all():
-        out["t3m_y2"] = float(vol.iloc[-27:-24].sum())
+    months = df["month"].str.slice(5, 7).astype(int)
+
+    def quarter(a, b, key, si_key):
+        w = vol.iloc[a:b] if b else vol.iloc[a:]
+        if len(w) == 3 and w.notna().all():
+            out[key] = float(w.sum())
+            if seasonal:
+                m = months.iloc[a:b] if b else months.iloc[a:]
+                des = sum(v / seasonal[int(mm)] for v, mm in zip(w, m))
+                out[si_key] = out[key] / des if des else None
+
+    if n >= 3:
+        quarter(-3, None, "current_t3m", "si_q_t")
+        if out["current_t3m"] is not None:
+            out["current_volume"] = out["current_t3m"]
+            window = vol.iloc[-DATA_RULES["peak_window_months"]:]
+            out["peak_volume"] = float(window.rolling(3).sum().max())
+    if n >= 6:
+        quarter(-6, -3, "previous_t3m", "si_q_prev")
+    if n >= 15:
+        quarter(-15, -12, "t3m_y1", "si_q_yoy")
     recent = df.iloc[-DATA_RULES["mape_window_months"]:]
     pairs = recent.dropna(subset=["sales_volume", "forecast"])
     out["actuals"] = pairs["sales_volume"].tolist()
@@ -304,18 +372,24 @@ def derive_inputs_from_history(history, upto: int | None = None) -> dict:
     return out
 
 
-def resolve_inputs(product: dict, upto: int | None = None) -> dict:
+def resolve_inputs(product: dict, upto: int | None = None, indices: dict | None = None) -> dict:
     """Return the demand-signal inputs for a product, from history or manual entry."""
     if product.get("input_mode") == "history":
-        d = derive_inputs_from_history(product.get("history"), upto)
+        seasonal, src = seasonal_indices_for(product, indices)
+        d = derive_inputs_from_history(product.get("history"), upto, seasonal)
         d["source"] = "Monthly history"
+        d["seasonality_source"] = src
+        d["seasonal_indices"] = seasonal
     else:
         f, a = _num(product.get("forecast")), _num(product.get("actual"))
         d = {
             "current_t3m": _num(product.get("current_t3m")),
             "previous_t3m": _num(product.get("previous_t3m")),
             "t3m_y1": _num(product.get("t3m_y1")),
-            "t3m_y2": _num(product.get("t3m_y2")),
+            "si_q_t": _num(product.get("si_q_t")),
+            "si_q_prev": _num(product.get("si_q_prev")),
+            "si_q_yoy": _num(product.get("si_q_t")),   # same quarter of the year as Q_t
+            "seasonality_source": "manual entry",
             "current_volume": _num(product.get("current_volume")),
             "peak_volume": _num(product.get("peak_volume")),
             "actuals": [a] if a is not None else [],
@@ -334,46 +408,52 @@ def resolve_inputs(product: dict, upto: int | None = None) -> dict:
 # 4. THE FOUR SIGNALS (raw values)
 # =============================================================================
 
-def calculate_momentum(current_t3m, t3m_y1, t3m_y2, previous_t3m=None, fallback: str = "chain") -> Metric:
-    """Final formula - year-on-year T3M momentum:
-        Momentum = [ (S_T3M,y0 ÷ S_T3M,y−1) + (S_T3M,y0 ÷ S_T3M,y−2) ] ÷ 2 − 1
-    S_T3M,y−1 / y−2 = sales in the same three months one / two years earlier.
+def calculate_momentum(q_t, q_prev, q_yoy, si_t=None, si_prev=None, si_yoy=None,
+                       fallback: str = "qoq") -> Metric:
+    """Final formula - average of QoQ and YoY growth on deseasonalised sales:
+        Momentum = [ (S′_Qt ÷ S′_Qt−1) + (S′_Qt ÷ S′_Qt−4) ] ÷ 2 − 1,   S′ = S ÷ seasonal index
+    Q_t = latest three months, Q_t−1 = the three months before, Q_t−4 = same quarter last year.
 
-    `fallback` (ASSUMPTION - for SKUs too young to have y−2 / y−1 history):
-        "strict" → N/A unless both prior years exist
-        "yoy"    → if y−2 is missing, use the y−1 ratio alone
-        "chain"  → as "yoy"; if y−1 is also missing, use sequential T3M growth (deck slide 5)"""
-    formula = "Momentum = [ (S_T3M,y0 ÷ S_T3M,y−1) + (S_T3M,y0 ÷ S_T3M,y−2) ] ÷ 2 − 1"
-    cur, y1, y2, prev = _num(current_t3m), _num(t3m_y1), _num(t3m_y2), _num(previous_t3m)
-    inputs = {"Current T3M sales (y0)": cur, "Same T3M last year (y−1)": y1,
-              "Same T3M two years ago (y−2)": y2}
-    if prev is not None:
-        inputs["Previous T3M sales (fallback only)"] = prev
-    if cur is None:
-        return _na("Momentum", "Needs current T3M sales.", inputs, formula)
-    if any(v is not None and v < 0 for v in (cur, y1, y2, prev)):
+    `fallback` (ASSUMPTION - SKUs younger than 15 months have no Q_t−4):
+        "qoq"    → use the QoQ term alone
+        "strict" → N/A"""
+    formula = "Momentum = [ (S′_Qt ÷ S′_Qt−1) + (S′_Qt ÷ S′_Qt−4) ] ÷ 2 − 1,   S′ = S ÷ seasonal index"
+    st_, sp, sy = _num(q_t), _num(q_prev), _num(q_yoy)
+    it, ip, iy = _num(si_t), _num(si_prev), _num(si_yoy)
+    inputs = {"Sales Q_t": st_, "Sales Q_t−1": sp, "Sales Q_t−4 (same quarter last year)": sy,
+              "Seasonal index Q_t": it, "Seasonal index Q_t−1": ip, "Seasonal index Q_t−4": iy}
+    if st_ is None or sp is None:
+        return _na("Momentum", "Needs sales for the current and previous quarter (6 months).", inputs, formula)
+    if any(v is not None and v < 0 for v in (st_, sp, sy)):
         return _na("Momentum", "Sales cannot be negative.", inputs, formula)
-    for v, lbl in ((y1, "y−1"), (y2, "y−2")):
-        if v == 0:
-            return _na("Momentum", f"T3M sales for {lbl} is zero - ratio undefined.", inputs, formula)
-    if y1 is not None and y2 is not None:
-        r1, r2 = cur / y1, cur / y2
-        m = (r1 + r2) / 2 - 1
-        return Metric("Momentum", raw=m, inputs=inputs, formula=formula, unit="growth",
-                      steps=[f"y0 ÷ y−1 = {cur:,.0f} ÷ {y1:,.0f} = {r1:.3f}",
-                             f"y0 ÷ y−2 = {cur:,.0f} ÷ {y2:,.0f} = {r2:.3f}",
-                             f"({r1:.3f} + {r2:.3f}) ÷ 2 − 1 = {m:+.1%}"])
-    if fallback in ("yoy", "chain") and y1 is not None:
-        m = cur / y1 - 1
-        return Metric("Momentum", raw=m, inputs=inputs, formula=formula, unit="growth", basis="Assumption",
-                      steps=["y−2 history not available → fallback: y−1 ratio only (assumption)",
-                             f"{cur:,.0f} ÷ {y1:,.0f} − 1 = {m:+.1%}"])
-    if fallback == "chain" and prev is not None and prev > 0:
-        m = (cur - prev) / prev
-        return Metric("Momentum", raw=m, inputs=inputs, formula=formula, unit="growth", basis="Assumption",
-                      steps=["No prior-year history → fallback: sequential T3M growth, deck slide 5 (assumption)",
-                             f"({cur:,.0f} − {prev:,.0f}) ÷ {prev:,.0f} = {m:+.1%}"])
-    return _na("Momentum", "Needs the same T3M one and two years earlier (27 months of history).", inputs, formula)
+    if any(v is not None and v <= 0 for v in (it, ip, iy)):
+        return _na("Momentum", "Seasonal indices must be greater than zero.", inputs, formula)
+    steps = []
+    if it is None or ip is None or (sy is not None and iy is None):
+        steps.append("Seasonal index not available for some quarters → taken as 1.00 (no adjustment)")
+    it, ip, iy = it or 1.0, ip or 1.0, iy or 1.0
+    dt, dp = st_ / it, sp / ip
+    steps += [f"S′_Qt = {st_:,.0f} ÷ {it:.3f} = {dt:,.0f}", f"S′_Qt−1 = {sp:,.0f} ÷ {ip:.3f} = {dp:,.0f}"]
+    if dp == 0:
+        return _na("Momentum", "Previous-quarter sales are zero - ratio undefined.", inputs, formula)
+    qoq = dt / dp
+    steps.append(f"QoQ ratio = {dt:,.0f} ÷ {dp:,.0f} = {qoq:.3f}")
+    if sy is not None:
+        dy = sy / iy
+        if dy == 0:
+            return _na("Momentum", "Same-quarter-last-year sales are zero - ratio undefined.", inputs, formula)
+        yoy = dt / dy
+        m = (qoq + yoy) / 2 - 1
+        steps += [f"S′_Qt−4 = {sy:,.0f} ÷ {iy:.3f} = {dy:,.0f}", f"YoY ratio = {dt:,.0f} ÷ {dy:,.0f} = {yoy:.3f}",
+                  f"({qoq:.3f} + {yoy:.3f}) ÷ 2 − 1 = {m:+.1%}"]
+        return Metric("Momentum", raw=m, inputs=inputs, formula=formula, unit="growth", steps=steps)
+    if fallback == "qoq":
+        m = qoq - 1
+        steps += ["Q_t−4 not available (< 15 months of history) → fallback: QoQ term only (assumption)",
+                  f"{qoq:.3f} − 1 = {m:+.1%}"]
+        return Metric("Momentum", raw=m, inputs=inputs, formula=formula, unit="growth", steps=steps,
+                      basis="Assumption")
+    return _na("Momentum", "Needs same-quarter-last-year sales (15 months of history).", inputs, formula)
 
 
 def calculate_predictability(actuals, forecasts) -> Metric:
@@ -435,8 +515,9 @@ def calculate_position(current_volume, peak_volume) -> Metric:
 
 
 SIGNAL_FUNCTIONS = {
-    "momentum": lambda d: calculate_momentum(d.get("current_t3m"), d.get("t3m_y1"), d.get("t3m_y2"),
-                                             d.get("previous_t3m"), d.get("momentum_fallback", "chain")),
+    "momentum": lambda d: calculate_momentum(d.get("current_t3m"), d.get("previous_t3m"), d.get("t3m_y1"),
+                                             d.get("si_q_t"), d.get("si_q_prev"), d.get("si_q_yoy"),
+                                             d.get("momentum_fallback", "qoq")),
     "predictability": lambda d: calculate_predictability(d.get("actuals"), d.get("forecasts")),
     "reach": lambda d: calculate_reach(d.get("active_points"), d.get("total_points")),
     "position": lambda d: calculate_position(d.get("current_volume"), d.get("peak_volume")),
@@ -959,7 +1040,7 @@ def validate_product(p: dict) -> list[dict]:
         add("warning", "age_months", "Age is missing - Introduction gate cannot be checked.")
     elif age < 0:
         add("error", "age_months", "Age cannot be negative.")
-    nonneg = ["current_t3m", "previous_t3m", "t3m_y1", "t3m_y2", "current_volume", "peak_volume", "forecast",
+    nonneg = ["current_t3m", "previous_t3m", "t3m_y1", "current_volume", "peak_volume", "forecast",
               "actual", "active_points", "avg_daily_demand", "std_daily_demand", "on_hand", "unit_cost",
               "lead_time_local_std", "lead_time_cross_std", "shelf_life_days"]
     for f in nonneg:
@@ -976,14 +1057,19 @@ def validate_product(p: dict) -> list[dict]:
                 add("error", "history", "History contains negative sales or forecast.")
             if len(df) < DATA_RULES["min_months_momentum"]:
                 add("warning", "history", f"Only {len(df)} months of history - the Momentum formula needs "
-                                          f"{DATA_RULES['min_months_momentum']} (same T3M one and two years back).")
+                                          f"{DATA_RULES['min_months_momentum']} (same quarter last year).")
             if df["forecast"].notna().sum() < DATA_RULES["min_months_predictability"]:
                 add("warning", "forecast", "Insufficient forecast history for Predictability.")
             ap = df["active_points"].dropna()
             act = float(ap.iloc[-1]) if len(ap) else None
     else:
-        if _num(p.get("t3m_y1")) is None or _num(p.get("t3m_y2")) is None:
-            add("warning", "t3m_y1", "Missing prior-year T3M sales (y−1 / y−2) - Momentum formula incomplete.")
+        if _num(p.get("previous_t3m")) is None or _num(p.get("t3m_y1")) is None:
+            add("warning", "t3m_y1", "Missing previous-quarter or same-quarter-last-year sales - "
+                                     "Momentum formula incomplete.")
+        for f in ("si_q_t", "si_q_prev"):
+            v = _num(p.get(f))
+            if v is not None and v <= 0:
+                add("error", f, "Seasonal index must be greater than zero.")
         if _num(p.get("forecast")) is None:
             add("warning", "forecast", "Missing forecast - Predictability cannot be calculated.")
         if _num(p.get("actual")) is None:
@@ -1044,8 +1130,9 @@ def evaluate_portfolio(products: dict[str, dict], settings: EngineSettings | Non
     settings = settings or EngineSettings()
     results: dict[str, dict] = {}
     raw = {}
+    indices = estimate_seasonal_indices(products)
     for pid, p in products.items():
-        inputs = resolve_inputs(p)
+        inputs = resolve_inputs(p, indices=indices)
         results[pid] = {"product": p, "inputs": inputs, "issues": validate_product(p)}
         raw[pid] = calculate_raw_signals(inputs, settings)
     normalise_signals(raw, settings)
@@ -1070,7 +1157,7 @@ def evaluate_portfolio(products: dict[str, dict], settings: EngineSettings | Non
             r["lss"], r["shadow_lss"], r["shadow_stage"] = lss_full, None, None
         r["life"] = life
 
-    monthly = monthly_lifecycle(products, settings)
+    monthly = monthly_lifecycle(products, settings, indices)
     for pid, p in products.items():
         r = results[pid]
         hist = monthly[monthly["product_id"] == pid] if not monthly.empty else pd.DataFrame()
@@ -1093,10 +1180,12 @@ def evaluate_portfolio(products: dict[str, dict], settings: EngineSettings | Non
 
     table = portfolio_table(results)
     alerts = generate_alerts(results)
-    return {"results": results, "table": table, "alerts": alerts, "monthly": monthly, "settings": settings}
+    return {"results": results, "table": table, "alerts": alerts, "monthly": monthly, "settings": settings,
+            "seasonal_indices": indices}
 
 
-def monthly_lifecycle(products: dict[str, dict], settings: EngineSettings) -> pd.DataFrame:
+def monthly_lifecycle(products: dict[str, dict], settings: EngineSettings,
+                      indices: dict | None = None) -> pd.DataFrame:
     """Slide 4 monthly loop: for every month refresh the four signals, calculate
     LSS, classify, compare with the previous month and apply the confirmation rule."""
     frames = {pid: history_frame(p.get("history")) for pid, p in products.items()
@@ -1114,7 +1203,7 @@ def monthly_lifecycle(products: dict[str, dict], settings: EngineSettings) -> pd
                 continue
             i = int(idx[0])
             p = products[pid]
-            inp = derive_inputs_from_history(p["history"], upto=i)
+            inp = derive_inputs_from_history(p["history"], upto=i, seasonal=seasonal_indices_for(p, indices)[0])
             inp["total_points"] = _num(p.get("total_points"))
             raw[pid] = calculate_raw_signals(inp, settings)
             age = _num(p.get("age_months"))

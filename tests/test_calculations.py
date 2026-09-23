@@ -75,26 +75,49 @@ def test_seasonality_scales_demand():
 
 
 def test_momentum_final_formula():
-    m = calc.calculate_momentum(120, 100, 80)
-    assert m.raw == pytest.approx(((120 / 100) + (120 / 80)) / 2 - 1)
+    # S′ = S ÷ SI;  [(S′t/S′t−1) + (S′t/S′t−4)] / 2 − 1
+    m = calc.calculate_momentum(1200, 1000, 900, si_t=1.2, si_prev=0.8, si_yoy=1.2)
+    dt, dp, dy = 1200 / 1.2, 1000 / 0.8, 900 / 1.2
+    assert m.raw == pytest.approx(((dt / dp) + (dt / dy)) / 2 - 1)
     assert m.basis == "Deck"
 
 
+def test_momentum_without_seasonal_index_is_raw():
+    m = calc.calculate_momentum(120, 100, 80)
+    assert m.raw == pytest.approx(((120 / 100) + (120 / 80)) / 2 - 1)
+
+
 def test_momentum_fallbacks():
-    assert calc.calculate_momentum(120, 100, None, fallback="yoy").raw == pytest.approx(0.2)
-    assert calc.calculate_momentum(120, 100, None, fallback="yoy").basis == "Assumption"
+    q = calc.calculate_momentum(120, 100, None, fallback="qoq")
+    assert q.raw == pytest.approx(0.2) and q.basis == "Assumption"
     assert not calc.calculate_momentum(120, 100, None, fallback="strict").ok
-    assert calc.calculate_momentum(120, None, None, previous_t3m=100, fallback="chain").raw == pytest.approx(0.2)
-    assert not calc.calculate_momentum(120, None, None, previous_t3m=100, fallback="yoy").ok
+    assert not calc.calculate_momentum(120, None, 100).ok
 
 
 def test_history_derivation_windows():
     hist = [{"month": f"{2024 + (i // 12)}-{i % 12 + 1:02d}", "sales_volume": float(i + 1),
-             "forecast": float(i + 1), "active_points": 10.0} for i in range(27)]
+             "forecast": float(i + 1), "active_points": 10.0} for i in range(15)]
     d = calc.derive_inputs_from_history(hist)
-    assert d["current_t3m"] == 25 + 26 + 27
-    assert d["t3m_y1"] == 13 + 14 + 15
-    assert d["t3m_y2"] == 1 + 2 + 3
+    assert d["current_t3m"] == 13 + 14 + 15
+    assert d["previous_t3m"] == 10 + 11 + 12
+    assert d["t3m_y1"] == 1 + 2 + 3
+
+
+def test_seasonal_indices_recover_pattern(portfolio):
+    idx = calc.estimate_seasonal_indices(portfolio)
+    b2c = idx["channel"]["B2C"]
+    assert sum(b2c.values()) / 12 == pytest.approx(1.0)
+    assert b2c[10] > 1.1 and b2c[7] < 0.9          # festive peak, monsoon dip (demo pattern)
+
+
+def test_deseasonalised_quarter_index():
+    hist = [{"month": f"2025-{m:02d}", "sales_volume": 100.0 * (2 if m >= 4 else 1), "forecast": None,
+             "active_points": None} for m in range(1, 7)]
+    seasonal = {m: (2.0 if m >= 4 else 1.0) for m in range(1, 13)}
+    d = calc.derive_inputs_from_history(hist, seasonal=seasonal)
+    assert d["si_q_t"] == pytest.approx(2.0) and d["si_q_prev"] == pytest.approx(1.0)
+    m = calc.calculate_momentum(d["current_t3m"], d["previous_t3m"], None, d["si_q_t"], d["si_q_prev"])
+    assert m.raw == pytest.approx(0.0)              # a purely seasonal jump is not momentum
 
 
 def test_annexure_a_lss_weights():
@@ -139,7 +162,7 @@ def test_lss_recalculates_and_stage_changes(portfolio):
     base = calc.evaluate_portfolio(portfolio)["results"][pid]
     p = portfolio[pid]
     p["input_mode"] = "manual"
-    p.update(current_t3m=50, t3m_y1=100, t3m_y2=110, forecast=100, actual=40, active_points=100, total_points=12000,
+    p.update(current_t3m=50, previous_t3m=100, t3m_y1=110, forecast=100, actual=40, active_points=100, total_points=12000,
              current_volume=50, peak_volume=400)
     new = calc.evaluate_portfolio(portfolio, calc.EngineSettings(confirm_enabled=False))["results"][pid]
     assert new["lss"].value != base["lss"].value
@@ -162,7 +185,7 @@ def test_add_and_delete_update_portfolio(portfolio):
     """Req 1, 3, 8."""
     n = len(calc.evaluate_portfolio(portfolio)["table"])
     new = demo_data.blank_product()
-    new.update(name="Test SKU", age_months=30, current_t3m=100, t3m_y1=90, t3m_y2=85, forecast=100, actual=95,
+    new.update(name="Test SKU", age_months=30, current_t3m=100, previous_t3m=90, t3m_y1=85, forecast=100, actual=95,
                active_points=500, total_points=1000, current_volume=100, peak_volume=120,
                avg_daily_demand=10, std_daily_demand=3, lead_time_local_days=7)
     portfolio[new["id"]] = new
@@ -176,7 +199,7 @@ def test_add_and_delete_update_portfolio(portfolio):
 def test_invalid_inputs_give_na_not_zero():
     """Req 11."""
     p = demo_data.blank_product()
-    p.update(name="Bad", age_months=40, current_t3m=-5, t3m_y1=100, t3m_y2=100, active_points=2000, total_points=1000,
+    p.update(name="Bad", age_months=40, current_t3m=-5, previous_t3m=100, t3m_y1=100, active_points=2000, total_points=1000,
              avg_daily_demand=10, std_daily_demand=2, lead_time_local_days=0)
     out = calc.evaluate_portfolio({p["id"]: p})
     r = out["results"][p["id"]]
@@ -220,7 +243,7 @@ def test_monthly_engine_and_pending_transition(portfolio):
 
 def test_percentile_fallback_with_few_products():
     p = demo_data.blank_product()
-    p.update(name="Solo", age_months=30, current_t3m=110, t3m_y1=100, t3m_y2=95, forecast=100, actual=90,
+    p.update(name="Solo", age_months=30, current_t3m=110, previous_t3m=100, t3m_y1=95, forecast=100, actual=90,
              active_points=300, total_points=1000, current_volume=110, peak_volume=130)
     r = calc.evaluate_portfolio({p["id"]: p})["results"][p["id"]]
     assert r["lss"].ok and r["signals"]["momentum"].basis == "Assumption"

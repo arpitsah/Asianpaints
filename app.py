@@ -47,7 +47,7 @@ def current_settings() -> calc.EngineSettings:
         normalisation=SS.get("set_norm", "percentile"),
         confirm_enabled=SS.get("set_confirm", True),
         confirm_months=int(SS.get("set_confirm_months", 2)),
-        momentum_fallback=SS.get("set_mom_fb", "chain"),
+        momentum_fallback=SS.get("set_mom_fb2", "qoq"),
         ordering_cost=float(SS.get("set_order_cost", 1000.0)),
         holding_rate=float(SS.get("set_hold", 20.0)) / 100,
         shelf_life_cap=SS.get("set_shelf", True),
@@ -152,11 +152,13 @@ def product_form(prefix: str, product: dict, is_new: bool):
             vals = {}
             if mode == "manual":
                 st.markdown("**Demand information** — Momentum & Predictability")
-                c = st.columns(4)
-                vals["current_t3m"] = _num_in_col(c[0], "Current T3M sales (y0)", product, "current_t3m", k)
-                vals["t3m_y1"] = _num_in_col(c[1], "Same T3M last year (y−1)", product, "t3m_y1", k)
-                vals["t3m_y2"] = _num_in_col(c[2], "Same T3M two years ago (y−2)", product, "t3m_y2", k)
-                vals["previous_t3m"] = _num_in_col(c[3], "Previous T3M (fallback only)", product, "previous_t3m", k)
+                c = st.columns(5)
+                vals["current_t3m"] = _num_in_col(c[0], "Sales this quarter (Q_t)", product, "current_t3m", k)
+                vals["previous_t3m"] = _num_in_col(c[1], "Sales previous quarter (Q_t−1)", product, "previous_t3m", k)
+                vals["t3m_y1"] = _num_in_col(c[2], "Same quarter last year (Q_t−4)", product, "t3m_y1", k)
+                vals["si_q_t"] = _num_in_col(c[3], "Seasonal index Q_t (also Q_t−4)", product, "si_q_t", k, 0.05)
+                vals["si_q_prev"] = _num_in_col(c[4], "Seasonal index Q_t−1", product, "si_q_prev", k, 0.05)
+                st.caption("Blank seasonal index = 1.00 (no adjustment). S′ = sales ÷ seasonal index.")
                 c = st.columns(4)
                 vals["forecast"] = _num_in_col(c[0], "Forecast (period)", product, "forecast", k)
                 vals["actual"] = _num_in_col(c[1], "Actual demand (period)", product, "actual", k)
@@ -170,7 +172,8 @@ def product_form(prefix: str, product: dict, is_new: bool):
             else:
                 st.markdown("**Monthly sales history** — one row per month (YYYY-MM). Momentum, Predictability, "
                             "Reach and Position are derived from this table by `derive_inputs_from_history()`. "
-                            "The Momentum formula needs 27 months (same T3M one and two years back).")
+                            "Momentum needs 15 months (same quarter last year); sales are deseasonalised "
+                            "with seasonal indices estimated from the portfolio's history.")
                 h = calc.history_frame(product.get("history"))
                 if h.empty:
                     h = pd.DataFrame({"month": [str(pd.Period("2026-08", "M") - i) for i in range(5, -1, -1)],
@@ -366,7 +369,10 @@ def tab_lss(out: dict):
         with col:
             ui.metric_kpi(f"{calc.SIGNAL_LABELS[s]} · {calc.LSS_WEIGHTS[s]:.0%}", m, "{:.1f}",
                           sub=calc.SIGNAL_QUESTIONS[s] if m.ok else m.reason, color=ui.ACCENT)
-            ui.calc_panel(m, "View calculation", raw_fmt=raw_fmt[s])
+    panels = st.columns(2)
+    for i, s in enumerate(calc.SIGNALS):
+        with panels[i % 2]:
+            ui.calc_panel(r["signals"][s], f"View calculation — {calc.SIGNAL_LABELS[s]}", raw_fmt=raw_fmt[s])
     lss_m = r["lss"]
     show = lss_m if lss_m.ok else calc.calculate_lss(r["scores"], calc.LSS_WEIGHTS)
     ui.calc_panel(show, "View calculation — LSS" + (" (shadow, age-gated)" if r["life"]["gated"] else ""))
@@ -388,10 +394,12 @@ def tab_lss(out: dict):
                     f"**{r['stage_info']['policy_stage'] or 'N/A'}**.")
     with st.expander("Inputs used for this calculation"):
         inp = r["inputs"]
-        st.caption(f"Source: {inp.get('source')}" + (f" · as of {inp.get('as_of')}" if inp.get("as_of") else ""))
-        show_inp = {"Current T3M sales (y0)": inp.get("current_t3m"),
-                    "Same T3M last year (y−1)": inp.get("t3m_y1"), "Same T3M two years ago (y−2)": inp.get("t3m_y2"),
-                    "Previous T3M (fallback)": inp.get("previous_t3m"),
+        st.caption(f"Source: {inp.get('source')}" + (f" · as of {inp.get('as_of')}" if inp.get("as_of") else "")
+                   + (f" · seasonal indices: {inp.get('seasonality_source')}" if inp.get("seasonality_source") else ""))
+        show_inp = {"Sales Q_t": inp.get("current_t3m"), "Sales Q_t−1": inp.get("previous_t3m"),
+                    "Sales Q_t−4 (same quarter last year)": inp.get("t3m_y1"),
+                    "Seasonal index Q_t": inp.get("si_q_t"), "Seasonal index Q_t−1": inp.get("si_q_prev"),
+                    "Seasonal index Q_t−4": inp.get("si_q_yoy"),
                     "Current T3M volume": inp.get("current_volume"), "Peak T3M volume": inp.get("peak_volume"),
                     "Forecast/actual periods": len(inp.get("actuals") or []),
                     "Active buying points": inp.get("active_points"),
@@ -862,6 +870,20 @@ def tab_detail(out: dict):
     with st.expander("Full recommendation", expanded=True):
         strategy_block(r)
 
+    seas = r["inputs"].get("seasonal_indices")
+    if seas:
+        ui.section("Seasonal indices used to deseasonalise Momentum",
+                   f"Estimated by estimate_seasonal_indices() · pooled at {r['inputs'].get('seasonality_source')} "
+                   "level · S′ = sales ÷ index.")
+        mnames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        vals = [seas[m] for m in range(1, 13)]
+        fig = go.Figure(go.Bar(x=mnames, y=vals, marker_color=[ui.ACCENT if v >= 1 else "#9DB4DA" for v in vals],
+                               text=[f"{v:.2f}" for v in vals], textposition="outside",
+                               hovertemplate="%{x}: index %{y:.3f}<extra></extra>"))
+        fig.add_hline(y=1, line=dict(color=ui.MUTED, dash="dot", width=1))
+        fig.update_yaxes(title="Seasonal index", range=[0, max(vals) * 1.2])
+        st.plotly_chart(ui.base_layout(fig, "", 240, legend=False), theme=None, config=PLOT_CFG, key="p_season")
+
     ui.section("Monthly lifecycle history",
                "Each month: refresh four signals → LSS → classify → compare with last month → confirmation rule.")
     mh = r["monthly"]
@@ -968,11 +990,10 @@ def sidebar(out: dict):
                  else "Absolute scale (assumption)")
         st.toggle("Require confirmation before policy change", value=True, key="set_confirm")
         st.slider("Confirmation months", 1, 4, 2, key="set_confirm_months", disabled=not SS.get("set_confirm", True))
-        st.radio("Momentum when y−1 / y−2 history is missing", ["chain", "yoy", "strict"], key="set_mom_fb",
-                 format_func={"chain": "Fallback: y−1 only, then sequential T3M (assumption)",
-                              "yoy": "Fallback: y−1 only (assumption)",
-                              "strict": "Strict: N/A without both years"}.get,
-                 help="The final Momentum formula needs the same T3M one and two years back (27 months).")
+        st.radio("Momentum when same-quarter-last-year is missing", ["qoq", "strict"], key="set_mom_fb2",
+                 format_func={"qoq": "Fallback: QoQ term only (assumption)",
+                              "strict": "Strict: N/A without Q_t−4"}.get,
+                 help="Momentum averages QoQ and YoY growth on deseasonalised sales; YoY needs 15 months.")
         st.caption("Decline cycle stock = EOQ √(2DS/H)")
         st.number_input("Ordering cost S (₹/order)", value=1000.0, step=100.0, key="set_order_cost")
         st.number_input("Holding rate H (% of unit cost p.a.)", value=20.0, step=1.0, key="set_hold")
